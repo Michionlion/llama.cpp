@@ -6544,6 +6544,92 @@ void ggml_gemv_q1_0_4x4_q8_0(
         constexpr int q8_blocks_per_q1 = QK1_0 / QK8_0;
 
         int x = 0;
+        // Three packs reuse Q8 work without the register spills of a four-pack tile.
+        for (; x + 2 < nc / 4; x += 3) {
+            const block_q1_0x4 * b_ptr0 = (const block_q1_0x4 *) vx + x * nb;
+            const block_q1_0x4 * b_ptr1 = b_ptr0 + nb;
+            const block_q1_0x4 * b_ptr2 = b_ptr1 + nb;
+
+            __m512 accf0_01 = _mm512_setzero_ps();
+            __m512 accf0_23 = _mm512_setzero_ps();
+            __m512 accf1_01 = _mm512_setzero_ps();
+            __m512 accf1_23 = _mm512_setzero_ps();
+            __m512 accf2_01 = _mm512_setzero_ps();
+            __m512 accf2_23 = _mm512_setzero_ps();
+
+            for (int l = 0; l < nb; l++) {
+                __m512 accb0_01 = _mm512_setzero_ps();
+                __m512 accb0_23 = _mm512_setzero_ps();
+                __m512 accb1_01 = _mm512_setzero_ps();
+                __m512 accb1_23 = _mm512_setzero_ps();
+                __m512 accb2_01 = _mm512_setzero_ps();
+                __m512 accb2_23 = _mm512_setzero_ps();
+
+                for (int k = 0; k < q8_blocks_per_q1; ++k) {
+                    const block_q8_0 * GGML_RESTRICT a_blk =
+                        a_ptr + l * q8_blocks_per_q1 + k;
+
+                    __m512i w0_01;
+                    __m512i w0_23;
+                    __m512i w1_01;
+                    __m512i w1_23;
+                    __m512i w2_01;
+                    __m512i w2_23;
+                    q1_0_expand_x4((const uint8_t *) b_ptr0[l].qs + 16 * k, &w0_01, &w0_23);
+                    q1_0_expand_x4((const uint8_t *) b_ptr1[l].qs + 16 * k, &w1_01, &w1_23);
+                    q1_0_expand_x4((const uint8_t *) b_ptr2[l].qs + 16 * k, &w2_01, &w2_23);
+
+                    const __m512i qa = _mm512_broadcast_i64x4(
+                        _mm256_loadu_si256((const __m256i *) a_blk->qs));
+                    const __m512i sq = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+
+                    const __m512 f0_01 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
+                        _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0_01, qa), sq));
+                    const __m512 f0_23 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
+                        _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0_23, qa), sq));
+                    const __m512 f1_01 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
+                        _mm512_dpbusd_epi32(_mm512_setzero_si512(), w1_01, qa), sq));
+                    const __m512 f1_23 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
+                        _mm512_dpbusd_epi32(_mm512_setzero_si512(), w1_23, qa), sq));
+                    const __m512 f2_01 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
+                        _mm512_dpbusd_epi32(_mm512_setzero_si512(), w2_01, qa), sq));
+                    const __m512 f2_23 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
+                        _mm512_dpbusd_epi32(_mm512_setzero_si512(), w2_23, qa), sq));
+
+                    const __m512 d1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(a_blk->d));
+                    accb0_01 = _mm512_fmadd_ps(f0_01, d1, accb0_01);
+                    accb0_23 = _mm512_fmadd_ps(f0_23, d1, accb0_23);
+                    accb1_01 = _mm512_fmadd_ps(f1_01, d1, accb1_01);
+                    accb1_23 = _mm512_fmadd_ps(f1_23, d1, accb1_23);
+                    accb2_01 = _mm512_fmadd_ps(f2_01, d1, accb2_01);
+                    accb2_23 = _mm512_fmadd_ps(f2_23, d1, accb2_23);
+                }
+
+                const __m512 d00 = _mm512_castps128_ps512(
+                    _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr0[l].d)));
+                const __m512 d01 = _mm512_castps128_ps512(
+                    _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr1[l].d)));
+                const __m512 d02 = _mm512_castps128_ps512(
+                    _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *) b_ptr2[l].d)));
+                const __m512 d00v01 = _mm512_permutexvar_ps(idx01, d00);
+                const __m512 d00v23 = _mm512_permutexvar_ps(idx23, d00);
+                const __m512 d01v01 = _mm512_permutexvar_ps(idx01, d01);
+                const __m512 d01v23 = _mm512_permutexvar_ps(idx23, d01);
+                const __m512 d02v01 = _mm512_permutexvar_ps(idx01, d02);
+                const __m512 d02v23 = _mm512_permutexvar_ps(idx23, d02);
+                accf0_01 = _mm512_fmadd_ps(accb0_01, d00v01, accf0_01);
+                accf0_23 = _mm512_fmadd_ps(accb0_23, d00v23, accf0_23);
+                accf1_01 = _mm512_fmadd_ps(accb1_01, d01v01, accf1_01);
+                accf1_23 = _mm512_fmadd_ps(accb1_23, d01v23, accf1_23);
+                accf2_01 = _mm512_fmadd_ps(accb2_01, d02v01, accf2_01);
+                accf2_23 = _mm512_fmadd_ps(accb2_23, d02v23, accf2_23);
+            }
+
+            _mm_storeu_ps(s + x * 4, q1_0_acc_pair_reduce_ps(accf0_01, accf0_23));
+            _mm_storeu_ps(s + (x + 1) * 4, q1_0_acc_pair_reduce_ps(accf1_01, accf1_23));
+            _mm_storeu_ps(s + (x + 2) * 4, q1_0_acc_pair_reduce_ps(accf2_01, accf2_23));
+        }
+
         for (; x + 1 < nc / 4; x += 2) {
             const block_q1_0x4 * b_ptr0 = (const block_q1_0x4 *) vx + x * nb;
             const block_q1_0x4 * b_ptr1 = b_ptr0 + nb;

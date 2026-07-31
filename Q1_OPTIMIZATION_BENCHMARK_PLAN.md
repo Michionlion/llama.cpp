@@ -750,6 +750,33 @@ COMMON_PPL_ARGS=(
     > "$RESULTS/q1-repack-readme-c512-chunk1-kld.txt" 2>&1
 ```
 
+For a GEMV change, also force batch one so every evaluated logit uses
+the single-row decode kernel:
+
+```bash
+GEMV_BASE_LOGITS=$RESULTS/q1-baseline-readme-c128-batch1.logits
+GEMV_PPL_ARGS=(
+    -m "$Q1_MODEL"
+    -f "$Q1_SRC/README.md"
+    -c 128
+    -t 8
+    -tb 8
+    -b 1
+    -ub 1
+    -ngl 0
+    -fa on
+    --chunks 1
+)
+
+"$BASE_BUILD/bin/llama-perplexity" "${GEMV_PPL_ARGS[@]}" \
+    --save-all-logits "$GEMV_BASE_LOGITS" \
+    > "$RESULTS/q1-baseline-readme-c128-batch1-ppl.txt" 2>&1
+"$CAND_BUILD/bin/llama-perplexity" "${GEMV_PPL_ARGS[@]}" \
+    --kl-divergence-base "$GEMV_BASE_LOGITS" \
+    --kl-divergence \
+    > "$RESULTS/q1-candidate-readme-c128-batch1-kld.txt" 2>&1
+```
+
 After the smoke gate passes, repeat with Wikitext-2. Download it only
 inside the Q1 result directory:
 
@@ -924,6 +951,63 @@ The following experiments were rejected:
 - AVX-512 exact activation quantization: 25 percent faster than AVX2 in
   isolation but produced no measurable end-to-end gain.
 
+### Twelve-output decode tile result
+
+Commit `2823d4495` was used as the clean checkpoint for a third
+optimization cycle. The retained follow-up extends the AVX-512 Q1 GEMV
+from an eight-output primary tile to a twelve-output primary tile. It
+processes three adjacent four-row packs together, sharing each Q8 load
+and correction across twelve output channels. The established eight- and
+four-output loops handle remainders, and GEMM is unchanged.
+
+Decode-only 27B results from two five-repetition orderings:
+
+| Ordering | Checkpoint tg32 | Twelve-output tg32 | Gain |
+| --- | ---: | ---: | ---: |
+| Candidate then checkpoint | 12.0560 | 13.3907 | 11.07 percent |
+| Checkpoint then candidate | 11.8961 | 13.2075 | 11.02 percent |
+| Pooled | 11.9761 | 13.2991 | 11.05 percent |
+
+In the combined pp128/tg32 protocol, pp128 was unchanged within noise:
+the checkpoint pooled to 30.2748 tokens/s and the candidate pooled to
+30.4256 tokens/s. Combined-run tg32 was noisier, but still pooled to
+11.6734 tokens/s for the candidate versus 11.2953 tokens/s for the
+checkpoint. Use the isolated decode pair for the kernel claim.
+
+A pinned `n=5120, nc=320` kernel harness produced identical checksums
+and measured the following ten-run means:
+
+| Build mode | Checkpoint GEMV | Twelve-output GEMV | Gain |
+| --- | ---: | ---: | ---: |
+| Release | 15.5380 us | 15.1499 us | 2.56 percent |
+| Release with IPO | 15.6224 us | 15.1652 us | 3.02 percent |
+
+The dedicated kernel comparator passed 10,000 direct and 500 repacked
+cases with maximum absolute error `9.15527e-05` and maximum relative
+error `2.98023e-05`. The full CPU backend suite passed all 17,403
+supported rows and all 215 supported Q1 rows. AVX-only, AVX2-only, and
+AVX-512-without-VBMI builds each passed 45/45 focused Q1 cases.
+
+A batch-1, 128-token quality pass forced the GEMV path for every
+evaluated logit. It reported PPL `2.2637` for both builds, zero KL
+divergence, zero RMS probability delta, and a 100 percent same-top-token
+rate. The candidate completed the pass in 10.98 seconds versus 13.50
+seconds for the checkpoint.
+
+Using the frozen Q2 measurements as a historical reference, the current
+combined-run Q1 result is about 14.2 percent faster for pp128 and 21.0
+percent faster for tg32. The isolated Q1 decode result is 37.8 percent
+faster than the frozen Q2 tg32 result. These are cross-session
+comparisons, not a new same-session Q1-versus-Q2 claim.
+
+Two correction-hoisting variants were rejected:
+
+- Precomputing scalar Q8 corrections in a thread-local array regressed
+  pooled tg32 by about 6.0 percent.
+- Using a negative correction as the VNNI accumulator required register
+  copies for each destination and regressed pooled tg32 by about 3.5
+  percent.
+
 ## Final handoff and future work
 
 Candidate source files:
@@ -937,12 +1021,13 @@ Candidate source files:
 The direct path expands Q1 bits to unsigned 0/2 codes with AVX-512 VBMI
 and computes `dot(2*b, q8) - sum(q8)` with VNNI. The repack stores four
 Q1 rows in four-byte chunks aligned with each Q8_0 block. Its AVX-512
-GEMV shares Q8 loads and corrections across eight output channels, and
-its 4x4 GEMM shares them across a four-activation tile. Q1 scales are
-applied after four Q8 subblocks. The follow-up AVX2 quantizer loads and
-scales four activation rows in parallel, packs their signed bytes
-directly into the same four-byte interleave, and exactly preserves scalar
-round-away-from-zero behavior.
+GEMV shares Q8 loads and corrections across twelve output channels,
+with eight- and four-output remainder paths. Its 4x4 GEMM shares them
+across a four-activation tile. Q1 scales are applied after four Q8
+subblocks. The follow-up AVX2 quantizer loads and scales four activation
+rows in parallel, packs their signed bytes directly into the same
+four-byte interleave, and exactly preserves scalar round-away-from-zero
+behavior.
 
 Runtime selection requires AVX-512, VNNI, VBMI, and a row count divisible
 by four for the Q1 repack. The activation quantizer uses AVX2 when
@@ -953,11 +1038,13 @@ or existing repack fallbacks.
 
 Remaining risks are Clang and cross-CPU coverage, wide-vector frequency
 behavior, full-corpus perplexity, and performance on shapes unlike the
-27B model. Wider Q1 output fusion was not robust on this host. A future
-independently reviewable optimization should instead examine a Q8
-correction sidecar or Q1-specific work chunking without changing the
-on-disk Q1 format. Either idea needs its own layout proof and benchmark
-pair.
+27B model. Sixteen-output Q1 fusion was not robust on this host, while
+the retained twelve-output tile stayed below its register-pressure
+failure point. A future independently reviewable optimization should
+examine Q1-specific work chunking or a correction sidecar populated
+during activation quantization, without changing the on-disk Q1 format.
+The rejected per-call correction prepass shows that either idea needs
+its own traffic analysis, layout proof, and benchmark pair.
 
 Before rerunning this protocol, the user must explicitly authorize a
 Q1 benchmark window that permits new Q1 build/result directories,
