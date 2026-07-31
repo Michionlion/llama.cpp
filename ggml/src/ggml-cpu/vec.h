@@ -581,6 +581,47 @@ inline static void ggml_vec_mad_f16(const int n, ggml_fp16_t * GGML_RESTRICT y, 
     }
 }
 
+inline static void ggml_vec_mad_f16_pair(
+        const int n,
+        ggml_fp16_t * GGML_RESTRICT y0,
+        ggml_fp16_t * GGML_RESTRICT y1,
+        const ggml_fp16_t * GGML_RESTRICT x,
+        const float v0,
+        const float v1) {
+#if defined(GGML_SIMD) && defined(__AVX__)
+    const int np = (n & ~(GGML_F16_STEP - 1));
+
+    const GGML_F16_VEC vx0 = GGML_F16_VEC_SET1(v0);
+    const GGML_F16_VEC vx1 = GGML_F16_VEC_SET1(v1);
+
+    GGML_F16_VEC ax [GGML_F16_ARR];
+    GGML_F16_VEC ay0[GGML_F16_ARR];
+    GGML_F16_VEC ay1[GGML_F16_ARR];
+
+    for (int i = 0; i < np; i += GGML_F16_STEP) {
+        for (int j = 0; j < GGML_F16_ARR; j++) {
+            ax [j] = GGML_F16_VEC_LOAD(x  + i + j*GGML_F16_EPR, j);
+            ay0[j] = GGML_F16_VEC_LOAD(y0 + i + j*GGML_F16_EPR, j);
+            ay1[j] = GGML_F16_VEC_LOAD(y1 + i + j*GGML_F16_EPR, j);
+
+            ay0[j] = GGML_F16_VEC_FMA(ay0[j], ax[j], vx0);
+            ay1[j] = GGML_F16_VEC_FMA(ay1[j], ax[j], vx1);
+
+            GGML_F16_VEC_STORE(y0 + i + j*GGML_F16_EPR, ay0, j);
+            GGML_F16_VEC_STORE(y1 + i + j*GGML_F16_EPR, ay1, j);
+        }
+    }
+#else
+    const int np = 0;
+#endif
+
+    for (int i = np; i < n; ++i) {
+        const float xi = GGML_CPU_FP16_TO_FP32(x[i]);
+        y0[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(y0[i]) + xi*v0);
+        y1[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(y1[i]) + xi*v1);
+    }
+}
+
 // xs and vs are byte strides of x and v
 inline static void ggml_vec_mad_f32_unroll(const int n, const int xs, const int vs, float * GGML_RESTRICT y, const float * GGML_RESTRICT xv, const float * GGML_RESTRICT vv) {
 
