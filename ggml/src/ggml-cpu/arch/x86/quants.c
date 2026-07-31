@@ -573,6 +573,48 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q2_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
+#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__)
+    const __m256i shifts_256 = _mm256_setr_epi8(
+         0,  2,  4,  6,  8, 10, 12, 14,
+        16, 18, 20, 22, 24, 26, 28, 30,
+        32, 34, 36, 38, 40, 42, 44, 46,
+        48, 50, 52, 54, 56, 58, 60, 62);
+    const __m512i shifts = _mm512_broadcast_i64x4(shifts_256);
+    const __m512i three  = _mm512_set1_epi8(3);
+    const __m512i ones   = _mm512_set1_epi8(1);
+    __m512 acc = _mm512_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const block_q8_0 * GGML_RESTRICT y0 = &y[i * 2 + 0];
+        const block_q8_0 * GGML_RESTRICT y1 = &y[i * 2 + 1];
+
+        const __m256i src0 = _mm256_broadcastq_epi64(
+            _mm_loadl_epi64((const __m128i *) &x[i].qs[0]));
+        const __m256i src1 = _mm256_broadcastq_epi64(
+            _mm_loadl_epi64((const __m128i *) &x[i].qs[8]));
+        __m512i src = _mm512_castsi256_si512(src0);
+        src = _mm512_inserti64x4(src, src1, 1);
+        const __m512i codes = _mm512_and_si512(_mm512_multishift_epi64_epi8(shifts, src), three);
+
+        __m512i qy = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y0->qs));
+        qy = _mm512_inserti64x4(qy, _mm256_loadu_si256((const __m256i *) y1->qs), 1);
+
+        const __m512i dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), codes, qy);
+        const __m512i sy = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qy);
+        const __m512 dot = _mm512_cvtepi32_ps(_mm512_sub_epi32(dp, sy));
+
+        __m512 d1 = _mm512_castps256_ps512(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y0->d)));
+        d1 = _mm512_insertf32x8(d1, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y1->d)), 1);
+        acc = _mm512_fmadd_ps(
+            _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(x[i].d)),
+            _mm512_mul_ps(d1, dot),
+            acc);
+    }
+
+    *s = hsum_float_8(_mm256_add_ps(
+        _mm512_castps512_ps256(acc),
+        _mm512_extractf32x8_ps(acc, 1)));
+#else
     const __m256i ones  = _mm256_set1_epi8(1);
 #if defined(__AVX512VBMI__) && defined(__AVX512VL__)
     const __m256i shifts = _mm256_setr_epi8(
@@ -617,6 +659,7 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     }
 
     *s = hsum_float_8(acc);
+#endif
 #else
     ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
