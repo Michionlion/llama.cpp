@@ -679,7 +679,54 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-#if defined(__AVX2__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__) && \
+    defined(__AVX512VBMI__)
+    const __m512i shifts = _mm512_set_epi64(
+        0x3e3d3c3b3a393837, 0x363534333231302f,
+        0x2e2d2c2b2a292827, 0x262524232221201f,
+        0x1e1d1c1b1a191817, 0x161514131211100f,
+        0x0e0d0c0b0a090807, 0x060504030201003f);
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i two = _mm512_set1_epi8(2);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 4];
+        __m256 acc_block = _mm256_setzero_ps();
+
+        for (int k = 0; k < 2; ++k) {
+            const block_q8_0 * GGML_RESTRICT y0 = &y_ptr[k * 2 + 0];
+            const block_q8_0 * GGML_RESTRICT y1 = &y_ptr[k * 2 + 1];
+            const __m512i packed = _mm512_broadcastq_epi64(
+                _mm_loadl_epi64((const __m128i *) &x[ib].qs[k * 8]));
+            // Expand each bit directly to its unsigned 0/2 code.
+            const __m512i codes = _mm512_and_si512(
+                _mm512_multishift_epi64_epi8(shifts, packed), two);
+
+            __m512i qy = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y0->qs));
+            qy = _mm512_inserti64x4(qy, _mm256_loadu_si256((const __m256i *) y1->qs), 1);
+
+            const __m512i dp = _mm512_dpbusd_epi32(zero, codes, qy);
+            const __m512i sy = _mm512_dpbusd_epi32(zero, ones, qy);
+            const __m512 dot = _mm512_cvtepi32_ps(_mm512_sub_epi32(dp, sy));
+
+            acc_block = _mm256_fmadd_ps(
+                _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y0->d)),
+                _mm512_castps512_ps256(dot),
+                acc_block);
+            acc_block = _mm256_fmadd_ps(
+                _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y1->d)),
+                _mm512_extractf32x8_ps(dot, 1),
+                acc_block);
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+    }
+
+    *s = hsum_float_8(acc);
+#elif defined(__AVX2__)
     const __m256i ones_8 = _mm256_set1_epi8(1);
     const __m256i ones_16 = _mm256_set1_epi16(1);
     const __m256i byte_shuf = _mm256_setr_epi8(
