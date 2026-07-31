@@ -175,6 +175,84 @@ static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m2
 }
 #endif
 
+#if defined(__AVX2__)
+static inline __m256i q8_0_round_away_from_zero(__m256 value) {
+    const __m256 truncated =
+        _mm256_round_ps(value, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+    const __m256 fraction = _mm256_andnot_ps(
+        _mm256_set1_ps(-0.0f), _mm256_sub_ps(value, truncated));
+    const __m256i round_mask = _mm256_castps_si256(
+        _mm256_cmp_ps(fraction, _mm256_set1_ps(0.5f), _CMP_GE_OQ));
+    const __m256i sign = _mm256_srai_epi32(_mm256_castps_si256(value), 31);
+    const __m256i correction = _mm256_and_si256(
+        round_mask, _mm256_or_si256(sign, _mm256_set1_epi32(1)));
+    return _mm256_add_epi32(_mm256_cvttps_epi32(value), correction);
+}
+#endif
+
+void ggml_quantize_mat_q8_0_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(QK8_0 == 32);
+    assert(k % QK8_0 == 0);
+    const int nb = k / QK8_0;
+
+    block_q8_0x4 * GGML_RESTRICT y = (block_q8_0x4 *) vy;
+
+#if defined(__AVX2__)
+    __m256 srcv[4][4];
+    __m256 idvec[4];
+
+    for (int i = 0; i < nb; ++i) {
+        for (int row = 0; row < 4; ++row) {
+            const float * xi = x + row * k + i * QK8_0;
+            const __m256 v0 = _mm256_loadu_ps(xi + 0);
+            const __m256 v1 = _mm256_loadu_ps(xi + 8);
+            const __m256 v2 = _mm256_loadu_ps(xi + 16);
+            const __m256 v3 = _mm256_loadu_ps(xi + 24);
+
+            const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+            __m256 max_abs = _mm256_andnot_ps(sign_bit, v0);
+            max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v1));
+            max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v2));
+            max_abs = _mm256_max_ps(max_abs, _mm256_andnot_ps(sign_bit, v3));
+
+            __m128 max4 = _mm_max_ps(
+                _mm256_extractf128_ps(max_abs, 1), _mm256_castps256_ps128(max_abs));
+            max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+            max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+            const float amax = _mm_cvtss_f32(max4);
+            const float d = amax / 127.0f;
+
+            y[i].d[row] = GGML_CPU_FP32_TO_FP16(d);
+            idvec[row] = _mm256_set1_ps(d != 0.0f ? 1.0f / d : 0.0f);
+            srcv[row][0] = v0;
+            srcv[row][1] = v1;
+            srcv[row][2] = v2;
+            srcv[row][3] = v3;
+        }
+
+        for (int j = 0; j < 4; ++j) {
+            __m256i q0 = q8_0_round_away_from_zero(
+                _mm256_mul_ps(srcv[0][j], idvec[0]));
+            __m256i q1 = q8_0_round_away_from_zero(
+                _mm256_mul_ps(srcv[1][j], idvec[1]));
+            __m256i q2 = q8_0_round_away_from_zero(
+                _mm256_mul_ps(srcv[2][j], idvec[2]));
+            __m256i q3 = q8_0_round_away_from_zero(
+                _mm256_mul_ps(srcv[3][j], idvec[3]));
+
+            q0 = _mm256_packs_epi32(q0, q1);
+            q2 = _mm256_packs_epi32(q2, q3);
+            q0 = _mm256_packs_epi16(q0, q2);
+            _mm256_storeu_si256((__m256i *) (y[i].qs + 32 * j), q0);
+        }
+    }
+#else
+    UNUSED(nb);
+    UNUSED(y);
+    ggml_quantize_mat_q8_0_4x4_generic(x, vy, k);
+#endif
+}
+
 void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(QK8_0 == 32);
     assert(k % QK8_0 == 0);

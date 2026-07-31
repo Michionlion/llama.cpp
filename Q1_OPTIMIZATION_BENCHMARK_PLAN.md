@@ -461,6 +461,129 @@ grep -q vpmultishiftqb "$RESULTS/q1-candidate-gemv-assembly.txt"
 grep -q vpdpbusd "$RESULTS/q1-candidate-gemm-assembly.txt"
 ```
 
+### Q8_0 4x4 activation quantizer
+
+The Q1 repack uses `ggml_quantize_mat_q8_0_4x4`. On x86, compare its
+AVX2 implementation byte-for-byte with the generic scalar routine,
+including half-way values that distinguish `roundf` from nearest-even
+rounding:
+
+```bash
+cat > "$RESULTS/q1-quantize-4x4-compare.cpp" <<'CPP'
+#include "ggml-cpu.h"
+#include "ggml-cpu/repack.h"
+
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+static uint32_t state = 0x31415926U;
+
+static uint32_t next_u32() {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+int main() {
+    ggml_cpu_init();
+    uint64_t values = 0;
+
+    {
+        constexpr int k = 32;
+        std::vector<float> source(4 * k, 0.0f);
+        std::vector<block_q8_0x4> generic(k / QK8_0);
+        std::vector<block_q8_0x4> optimized(k / QK8_0);
+
+        for (int row = 0; row < 4; ++row) {
+            source[row * k + 0] = 127.0f;
+            source[row * k + 1] = 0.5f;
+            source[row * k + 2] = -0.5f;
+            source[row * k + 3] = 1.5f;
+            source[row * k + 4] = -1.5f;
+        }
+
+        ggml_quantize_mat_q8_0_4x4_generic(source.data(), generic.data(), k);
+        ggml_quantize_mat_q8_0_4x4(source.data(), optimized.data(), k);
+        const size_t bytes = optimized.size() * sizeof(optimized[0]);
+        if (std::memcmp(generic.data(), optimized.data(), bytes) != 0) {
+            std::fputs("half-way rounding mismatch\n", stderr);
+            return 1;
+        }
+        values += 4 * k;
+    }
+
+    for (int test = 0; test < 2000; ++test) {
+        const int k = 32 * (1 + next_u32() % 64);
+        std::vector<float> source(4 * k);
+        std::vector<block_q8_0x4> generic(k / QK8_0);
+        std::vector<block_q8_0x4> optimized(k / QK8_0);
+
+        for (float & value : source) {
+            value = (int32_t) (next_u32() & 0xffff) / 1024.0f - 32.0f;
+        }
+
+        ggml_quantize_mat_q8_0_4x4_generic(source.data(), generic.data(), k);
+        ggml_quantize_mat_q8_0_4x4(source.data(), optimized.data(), k);
+        const size_t bytes = optimized.size() * sizeof(optimized[0]);
+        if (std::memcmp(generic.data(), optimized.data(), bytes) != 0) {
+            std::fprintf(stderr, "mismatch: test=%d k=%d\n", test, k);
+            return 1;
+        }
+        values += 4 * k;
+    }
+
+    constexpr int k = 5120;
+    constexpr int iterations = 2000;
+    std::vector<float> source(4 * k);
+    std::vector<block_q8_0x4> output(k / QK8_0);
+    for (float & value : source) {
+        value = (int32_t) (next_u32() & 0xffff) / 1024.0f - 32.0f;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        ggml_quantize_mat_q8_0_4x4_generic(source.data(), output.data(), k);
+    }
+    auto stop = std::chrono::steady_clock::now();
+    const double generic_us =
+        std::chrono::duration<double, std::micro>(stop - start).count() / iterations;
+
+    start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        ggml_quantize_mat_q8_0_4x4(source.data(), output.data(), k);
+    }
+    stop = std::chrono::steady_clock::now();
+    const double optimized_us =
+        std::chrono::duration<double, std::micro>(stop - start).count() / iterations;
+
+    std::printf(
+        "cases=2001 values=%llu generic_us=%.3f optimized_us=%.3f speedup=%.3fx\n",
+        (unsigned long long) values, generic_us, optimized_us,
+        generic_us / optimized_us);
+}
+CPP
+
+c++ -O2 -std=c++17 \
+    -I"$Q1_SRC/ggml/include" \
+    -I"$Q1_SRC/ggml/src" \
+    "$RESULTS/q1-quantize-4x4-compare.cpp" \
+    -L"$CAND_BUILD/bin" \
+    -Wl,-rpath,"$CAND_BUILD/bin" \
+    -lggml-cpu -lggml-base -lggml \
+    -o "$CAND_BUILD/bin/q1-quantize-4x4-compare"
+
+taskset -c 0 "$CAND_BUILD/bin/q1-quantize-4x4-compare" \
+    > "$RESULTS/q1-candidate-quantize-4x4-compare.txt"
+```
+
+This comparator is required because `test-quantize-fns` does not invoke
+the four-row activation quantizer, and backend tolerances do not prove
+that its byte layout and rounding match the scalar implementation.
+
 ## Kernel performance
 
 `test-quantize-perf` measures the direct dot, not the repacked model route.
@@ -753,6 +876,54 @@ the previous Q2 work. The Q1 GGUF is 3.792 GB versus 7.574 GB for Q2,
 but attention, activation traffic, scheduling, and non-matrix kernels
 prevent model throughput from scaling directly with weight size.
 
+### Follow-up activation quantizer result
+
+Commit `4e246ff7f` was used as the clean checkpoint for a second
+optimization cycle. The retained follow-up adds an AVX2
+`ggml_quantize_mat_q8_0_4x4` implementation for Q1 prompt activations.
+It preserves the scalar routine's round-away-from-zero behavior and
+four-byte interleave exactly.
+
+- Randomized quantizer comparator: 2,000 cases and 8,336,512 values,
+  with zero byte mismatches.
+- Isolated `k=5120` quantizer: about 59.3 us scalar versus 4.44 us AVX2,
+  a 13.4x speedup.
+- Full CPU backend suite: all 17,403 supported rows passed; all 215
+  supported Q1 rows passed.
+- AVX-only generic fallback, AVX2-only, and AVX-512-without-VBMI builds
+  compiled and passed 45/45 focused Q1 cases.
+
+Prompt-size sweep:
+
+| Workload | Checkpoint tokens/s | AVX2 quantizer tokens/s | Gain |
+| --- | ---: | ---: | ---: |
+| pp8 | 22.5660 | 26.9433 | 19.40 percent |
+| pp32 | 28.2860 | 29.9770 | 5.98 percent |
+| pp128 | 29.3071 | 30.6624 | 4.62 percent |
+| pp512 | 29.5031 | 30.9419 | 4.88 percent |
+
+Across two five-repetition pp128 orderings, the checkpoint averaged
+29.1378 tokens/s and the retained candidate averaged 30.8910 tokens/s,
+a 6.02 percent gain. The quantizer is not used by the single-row decode
+path, so tg32 is considered unchanged.
+
+The exact-rounding quality check against checkpoint logits reported a
+perplexity ratio of `1.000001`, mean KLD `-0.000001`, maximum KLD
+`0.000047`, RMS probability delta `0.000 percent`, and a
+`100.000 percent` same-top-token rate.
+
+The following experiments were rejected:
+
+- Signed-byte VNNI: this CPU lacks `AVX-VNNI-INT8` and therefore has no
+  `VPDPBSSD` instruction.
+- Sixteen-output GEMV fusion: tg32 regressed 18.4 percent.
+- Paired eight-output GEMM: pp8 regressed 8.2 percent and pp32 regressed
+  3.3 percent for only marginal large-prompt gains.
+- Nearest-even activation rounding: faster, but exceeded the perplexity,
+  maximum-KLD, and RMS probability gates.
+- AVX-512 exact activation quantization: 25 percent faster than AVX2 in
+  isolation but produced no measurable end-to-end gain.
+
 ## Final handoff and future work
 
 Candidate source files:
@@ -768,19 +939,25 @@ and computes `dot(2*b, q8) - sum(q8)` with VNNI. The repack stores four
 Q1 rows in four-byte chunks aligned with each Q8_0 block. Its AVX-512
 GEMV shares Q8 loads and corrections across eight output channels, and
 its 4x4 GEMM shares them across a four-activation tile. Q1 scales are
-applied after four Q8 subblocks.
+applied after four Q8 subblocks. The follow-up AVX2 quantizer loads and
+scales four activation rows in parallel, packs their signed bytes
+directly into the same four-byte interleave, and exactly preserves scalar
+round-away-from-zero behavior.
 
 Runtime selection requires AVX-512, VNNI, VBMI, and a row count divisible
-by four. Existing AVX2, AVX, SSSE3, generic, and non-x86 direct paths are
-unchanged. Non-qualifying tensors and architectures retain the established
-generic or existing repack fallbacks.
+by four for the Q1 repack. The activation quantizer uses AVX2 when
+available and the generic scalar implementation otherwise. Existing AVX2,
+AVX, SSSE3, generic, and non-x86 direct paths are unchanged.
+Non-qualifying tensors and architectures retain the established generic
+or existing repack fallbacks.
 
 Remaining risks are Clang and cross-CPU coverage, wide-vector frequency
 behavior, full-corpus perplexity, and performance on shapes unlike the
-27B model. A future independently reviewable optimization should explore
-an eight- or sixteen-output Q1 tile, or storing a Q8 block correction
-sum during activation quantization, without changing the on-disk Q1
-format. Those ideas need their own layout proof and benchmark pair.
+27B model. Wider Q1 output fusion was not robust on this host. A future
+independently reviewable optimization should instead examine a Q8
+correction sidecar or Q1-specific work chunking without changing the
+on-disk Q1 format. Either idea needs its own layout proof and benchmark
+pair.
 
 Before rerunning this protocol, the user must explicitly authorize a
 Q1 benchmark window that permits new Q1 build/result directories,
