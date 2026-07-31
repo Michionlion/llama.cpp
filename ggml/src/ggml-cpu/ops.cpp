@@ -8714,6 +8714,198 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     }
 }
 
+static void ggml_compute_forward_flash_attn_ext_f16_gqa_pair_chunk(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int64_t q_head,
+        int64_t ic_start,
+        int64_t ic_end,
+        float * partials,
+        int64_t partial_stride) {
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q, nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k, nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+
+    GGML_ASSERT(partials != nullptr);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F16);
+    GGML_ASSERT(v->type == GGML_TYPE_F16);
+    GGML_ASSERT(neq1 == 1 && neq3 == 1);
+    GGML_ASSERT(q_head >= 0 && q_head + 1 < neq2);
+    GGML_ASSERT(nek2 == nev2 && neq2 % nek2 == 0);
+    GGML_ASSERT(nbq0 == sizeof(float));
+    GGML_ASSERT(nbk0 == sizeof(ggml_fp16_t));
+    GGML_ASSERT(nbv0 == sizeof(ggml_fp16_t));
+
+    const int64_t gqa = neq2/nek2;
+    GGML_ASSERT(gqa >= 2 && gqa % 2 == 0);
+    GGML_ASSERT(q_head % gqa + 1 < gqa);
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    float slope[2];
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t h = q_head + i;
+        slope[i] = (max_bias > 0.0f) ?
+            h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) :
+            1.0f;
+    }
+
+    const int ith = params->ith;
+
+    // Two FP16 accumulators and two FP16 queries fit in the existing decode scratch.
+    float       * VKQ32   = (float *) params->wdata + ith*(DK + 2*DV + CACHE_LINE_SIZE_F32);
+    ggml_fp16_t * VKQ16_0 = (ggml_fp16_t *) (VKQ32 + DV);
+    ggml_fp16_t * VKQ16_1 = VKQ16_0 + DV;
+    ggml_fp16_t * Q_q_0   = (ggml_fp16_t *) (VKQ32 + 2*DV);
+    ggml_fp16_t * Q_q_1   = Q_q_0 + DK;
+
+    memset(VKQ16_0, 0, 2*DV*sizeof(ggml_fp16_t));
+
+    ggml_from_float_t const q_to_f16 = ggml_get_type_traits_cpu(GGML_TYPE_F16)->from_float;
+    GGML_ASSERT(q_to_f16);
+
+    const float * pq0 = (const float *) ((const char *) q->data + (q_head + 0)*nbq2);
+    const float * pq1 = (const float *) ((const char *) q->data + (q_head + 1)*nbq2);
+    q_to_f16(pq0, Q_q_0, DK);
+    q_to_f16(pq1, Q_q_1, DK);
+
+    const ggml_fp16_t * mp[2] = {
+        mask ? (const ggml_fp16_t *) ((const char *) mask->data + ((q_head + 0)%mask->ne[2])*mask->nb[2]) : nullptr,
+        mask ? (const ggml_fp16_t *) ((const char *) mask->data + ((q_head + 1)%mask->ne[2])*mask->nb[2]) : nullptr,
+    };
+
+    const int64_t ik2 = q_head/gqa;
+    const int64_t iv2 = q_head/gqa;
+
+    float S[2] = { 0.0f, 0.0f };
+    float M[2] = { -INFINITY, -INFINITY };
+
+    for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        bool active[2] = { true, true };
+        float mv[2] = { 0.0f, 0.0f };
+
+        for (int i = 0; i < 2; ++i) {
+            if (mp[i]) {
+                mv[i] = slope[i]*GGML_CPU_FP16_TO_FP32(mp[i][ic]);
+                active[i] = mv[i] != -INFINITY;
+            }
+        }
+
+        if (!active[0] && !active[1]) {
+            continue;
+        }
+
+        const ggml_fp16_t * k_data = (const ggml_fp16_t *) ((const char *) k->data + ic*nbk1 + ik2*nbk2);
+
+        float s[2];
+        if (active[0] && active[1]) {
+            ggml_vec_dot_f16_unroll(DK, DK*sizeof(ggml_fp16_t), s, Q_q_0, const_cast<ggml_fp16_t *>(k_data));
+        } else {
+            const int i = active[0] ? 0 : 1;
+            ggml_vec_dot_f16(DK, s + i, 0, const_cast<ggml_fp16_t *>(k_data), 0, i == 0 ? Q_q_0 : Q_q_1, 0, 1);
+        }
+
+        float ms[2] = { 1.0f, 1.0f };
+        float vs[2] = { 1.0f, 1.0f };
+
+        for (int i = 0; i < 2; ++i) {
+            if (!active[i]) {
+                continue;
+            }
+
+            s[i] *= scale;
+            if (logit_softcap != 0.0f) {
+                s[i] = logit_softcap*tanhf(s[i]);
+            }
+            s[i] += mv[i];
+
+            if (s[i] > M[i]) {
+                ms[i] = expf(M[i] - s[i]);
+                M[i] = s[i];
+                ggml_vec_scale_f16(DV, i == 0 ? VKQ16_0 : VKQ16_1, ms[i]);
+            } else {
+                vs[i] = expf(s[i] - M[i]);
+            }
+        }
+
+        const ggml_fp16_t * v_data = (const ggml_fp16_t *) ((const char *) v->data + ic*nbv1 + iv2*nbv2);
+
+        if (active[0] && active[1]) {
+            ggml_vec_mad_f16_pair(DV, VKQ16_0, VKQ16_1, v_data, vs[0], vs[1]);
+        } else {
+            const int i = active[0] ? 0 : 1;
+            ggml_vec_mad_f16(DV, i == 0 ? VKQ16_0 : VKQ16_1, v_data, vs[i]);
+        }
+
+        for (int i = 0; i < 2; ++i) {
+            if (active[i]) {
+                S[i] = S[i]*ms[i] + vs[i];
+            }
+        }
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        const ggml_fp16_t * VKQ16 = i == 0 ? VKQ16_0 : VKQ16_1;
+        for (int64_t d = 0; d < DV; ++d) {
+            VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+        }
+
+        const int64_t h = q_head + i;
+
+        if (sinks && ic_start == 0) {
+            const float s = ((const float *) sinks->data)[h];
+
+            float ms = 1.0f;
+            float vs = 1.0f;
+
+            if (s > M[i]) {
+                ms = expf(M[i] - s);
+                M[i] = s;
+                ggml_vec_scale_f32(DV, VKQ32, ms);
+            } else {
+                vs = expf(s - M[i]);
+            }
+
+            S[i] = S[i]*ms + vs;
+        }
+
+        float * partial = partials + h*partial_stride;
+        partial[0] = M[i];
+        partial[1] = S[i];
+        memcpy(partial + 2, VKQ32, DV*sizeof(float));
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9124,9 +9316,25 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+#if defined(__AVX512F__) && !defined(__AVX512FP16__)
+    const int64_t gqa = neq2/nek2;
+    const bool can_use_gqa_pair_path = use_split_kv_path &&
+        k->type == GGML_TYPE_F16 &&
+        nek2 == nev2 &&
+        neq2 % nek2 == 0 &&
+        gqa >= 2 &&
+        gqa % 2 == 0;
+#else
+    const bool can_use_gqa_pair_path = false;
+#endif
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
+
+        // The paired loop pays off once a shared K+V chunk is well beyond this
+        // target's 512 KiB L2. Keep the original single-head loop below that point.
+        const size_t kv_chunk_bytes = chunk_size*(nbk1 + nbv1);
+        const bool use_gqa_pair_path = can_use_gqa_pair_path && kv_chunk_bytes > 768*1024;
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
@@ -9139,10 +9347,18 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         float *       chunk_partials = partials_base + ith * partial_size;
 
         if (ic_start < nek1) {
-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-                    params, dst, q_head, q_head + 1, ic_start, ic_end,
-                    chunk_partials, partial_stride);
+            if (use_gqa_pair_path) {
+                for (int64_t q_head = 0; q_head < neq2; q_head += 2) {
+                    ggml_compute_forward_flash_attn_ext_f16_gqa_pair_chunk(
+                        params, dst, q_head, ic_start, ic_end,
+                        chunk_partials, partial_stride);
+                }
+            } else {
+                for (int64_t q_head = 0; q_head < neq2; q_head++) {
+                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+                        params, dst, q_head, q_head + 1, ic_start, ic_end,
+                        chunk_partials, partial_stride);
+                }
             }
         } else {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
