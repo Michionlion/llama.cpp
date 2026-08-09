@@ -15,6 +15,12 @@
 #include "ggml.h"
 #include "common.h"
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+void ggml_gemm_iq2_xs_8x8_q8_K_rows(
+        int n, float * s0, float * s1, float * s2, float * s3, const void * vx,
+        const void * v0, const void * v1, const void * v2, const void * v3, int nc);
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -1208,6 +1214,82 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    if (type == GGML_TYPE_IQ2_XS) {
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            const int64_t tile_ir1_end = MIN(iir1 + blck_1, ir1_end);
+            int64_t ir1 = iir1;
+
+            for (; ir1 + 4 <= tile_ir1_end; ir1 += 4) {
+                const char * src0_rows[4];
+                const char * src1_cols[4];
+                float * dst_cols[4];
+
+                for (int m = 0; m < 4; ++m) {
+                    const int64_t row = ir1 + m;
+                    const int64_t i13 = row / (ne12 * ne1);
+                    const int64_t i12 = (row - i13 * ne12 * ne1) / ne1;
+                    const int64_t i11 = row - i13 * ne12 * ne1 - i12 * ne1;
+                    const int64_t i03 = i13 / r3;
+                    const int64_t i02 = i12 / r2;
+
+                    src0_rows[m] = (const char *) src0->data + i02 * nb02 + i03 * nb03;
+                    src1_cols[m] = (const char *) wdata +
+                        (src1_cont || src1->type != vec_dot_type
+                            ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                            : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                    dst_cols[m] = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
+                }
+
+                const bool same_weights = src0_rows[0] == src0_rows[1] && src0_rows[0] == src0_rows[2] &&
+                                          src0_rows[0] == src0_rows[3];
+                for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                    const int64_t tile_ir0_end = MIN(iir0 + blck_0, ir0_end);
+                    const int64_t nc = same_weights ? (tile_ir0_end - iir0) & ~7LL : 0;
+
+                    if (nc > 0) {
+                        ggml_gemm_iq2_xs_8x8_q8_K_rows(
+                                ne00,
+                                dst_cols[0] + iir0, dst_cols[1] + iir0,
+                                dst_cols[2] + iir0, dst_cols[3] + iir0,
+                                src0_rows[0] + iir0 * nb01,
+                                src1_cols[0], src1_cols[1], src1_cols[2], src1_cols[3], nc);
+                    }
+
+                    for (int m = 0; m < 4; ++m) {
+                        for (int64_t ir0 = iir0 + nc; ir0 < tile_ir0_end; ++ir0) {
+                            vec_dot(ne00, &dst_cols[m][ir0], 0, src0_rows[m] + ir0 * nb01, 0, src1_cols[m], 0, 1);
+                        }
+                    }
+                }
+            }
+
+            for (; ir1 < tile_ir1_end; ++ir1) {
+                const int64_t i13 = ir1 / (ne12 * ne1);
+                const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                const int64_t i11 = ir1 - i13 * ne12 * ne1 - i12 * ne1;
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+                const char * src0_row = (const char *) src0->data + i02 * nb02 + i03 * nb03;
+                const char * src1_col = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                float * dst_col = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
+
+                for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                    const int64_t tile_ir0_end = MIN(iir0 + blck_0, ir0_end);
+                    for (int64_t ir0 = iir0; ir0 < tile_ir0_end; ++ir0) {
+                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
+                    }
+                    memcpy(&dst_col[iir0], tmp, (tile_ir0_end - iir0) * sizeof(float));
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
@@ -1487,6 +1569,71 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const int64_t blck_1 = 16;
 
     float tmp[16];
+
+#if defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    if (type == GGML_TYPE_IQ2_XS) {
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            const int64_t tile_ir1_end = MIN(iir1 + blck_1, ir1_end);
+            int64_t ir1 = iir1;
+
+            for (; ir1 + 4 <= tile_ir1_end; ir1 += 4) {
+                const char * src1_cols[4];
+                float * dst_cols[4];
+
+                for (int m = 0; m < 4; ++m) {
+                    const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1 + m);
+                    const int64_t i11 = row_mapping.i1 % ne11;
+                    const int64_t i12 = row_mapping.i2;
+                    src1_cols[m] = (const char *) wdata +
+                        (src1_cont || src1->type != vec_dot_type
+                            ? (i11 + i12 * ne11) * row_size
+                            : (i11 * nb11 + i12 * nb12));
+                    dst_cols[m] = (float *) ((char *) dst->data + row_mapping.i1 * nb1 + i12 * nb2);
+                }
+
+                for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                    const int64_t tile_ir0_end = MIN(iir0 + blck_0, ir0_end);
+                    const int64_t nc = (tile_ir0_end - iir0) & ~7LL;
+
+                    if (nc > 0) {
+                        ggml_gemm_iq2_xs_8x8_q8_K_rows(
+                                ne00,
+                                dst_cols[0] + iir0, dst_cols[1] + iir0,
+                                dst_cols[2] + iir0, dst_cols[3] + iir0,
+                                src0_cur + iir0 * nb01,
+                                src1_cols[0], src1_cols[1], src1_cols[2], src1_cols[3], nc);
+                    }
+
+                    for (int m = 0; m < 4; ++m) {
+                        for (int64_t ir0 = iir0 + nc; ir0 < tile_ir0_end; ++ir0) {
+                            vec_dot(ne00, &dst_cols[m][ir0], 0, src0_cur + ir0 * nb01, 0, src1_cols[m], 0, 1);
+                        }
+                    }
+                }
+            }
+
+            for (; ir1 < tile_ir1_end; ++ir1) {
+                const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+                const char * src1_col = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12 * ne11) * row_size
+                        : (i11 * nb11 + i12 * nb12));
+                float * dst_col = (float *) ((char *) dst->data + row_mapping.i1 * nb1 + i12 * nb2);
+
+                for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                    const int64_t tile_ir0_end = MIN(iir0 + blck_0, ir0_end);
+                    for (int64_t ir0 = iir0; ir0 < tile_ir0_end; ++ir0) {
+                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0 * nb01, 0, src1_col, 0, 1);
+                    }
+                    memcpy(&dst_col[iir0], tmp, (tile_ir0_end - iir0) * sizeof(float));
+                }
+            }
+        }
+        return;
+    }
+#endif
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
